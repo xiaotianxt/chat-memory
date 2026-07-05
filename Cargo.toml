@@ -1,0 +1,12 @@
+[package]
+name = "chat-memory"
+version = "0.1.0"
+edition = "2021"
+description = "Local-first search and capture service for ChatGPT and agent chat history"
+license = "MIT"
+repository = "https://github.com/xiaotianxt/chat-memory"
+
+[dependencies]
+rusqlite = "0.31.0"
+serde_json = "1.0"
+sha2 = "0.11"

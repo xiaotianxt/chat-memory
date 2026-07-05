@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-bin: false
+
+      - name: Verify arm64 runner
+        run: test "$(uname -m)" = "arm64"
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Archive
+        run: |
+          mkdir -p archive
+          cp target/release/chat-memory archive/
+          cd archive
+          tar czf ../chat-memory-${{ github.ref_name }}-darwin-arm64.tar.gz chat-memory
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: chat-memory-${{ github.ref_name }}-darwin-arm64
+          path: chat-memory-${{ github.ref_name }}-darwin-arm64.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: chat-memory-*
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: chat-memory-*.tar.gz
+          generate_release_notes: true
+

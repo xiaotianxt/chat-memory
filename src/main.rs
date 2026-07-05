@@ -1226,7 +1226,7 @@ fn ensure_chatgpt_schema(conn: &Connection) -> Result<(), String> {
             message_count INTEGER NOT NULL,
             max_message_time REAL,
             PRIMARY KEY(conversation_pk, snapshot_hash),
-            FOREIGN KEY(conversation_pk) REFERENCES conversations(conversation_pk) ON DELETE CASCADE
+            FOREIGN KEY (conversation_pk) REFERENCES conversations(conversation_pk) ON DELETE CASCADE
         );
         CREATE TABLE IF NOT EXISTS messages (
             conversation_pk INTEGER NOT NULL,
@@ -1241,7 +1241,7 @@ fn ensure_chatgpt_schema(conn: &Connection) -> Result<(), String> {
             snapshot_hash TEXT,
             is_current INTEGER NOT NULL DEFAULT 1,
             PRIMARY KEY(conversation_pk, message_id),
-            FOREIGN KEY(conversation_pk) REFERENCES conversations(conversation_pk) ON DELETE CASCADE
+            FOREIGN KEY (conversation_pk) REFERENCES conversations(conversation_pk) ON DELETE CASCADE
         );
         CREATE TABLE IF NOT EXISTS search_documents (
             doc_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1253,7 +1253,7 @@ fn ensure_chatgpt_schema(conn: &Connection) -> Result<(), String> {
             text_ngram TEXT NOT NULL DEFAULT '',
             indexed_at REAL NOT NULL,
             snapshot_hash TEXT,
-            FOREIGN KEY(conversation_pk) REFERENCES conversations(conversation_pk) ON DELETE CASCADE
+            FOREIGN KEY (conversation_pk) REFERENCES conversations(conversation_pk) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_search_documents_conv ON search_documents(conversation_pk);
         CREATE INDEX IF NOT EXISTS idx_search_documents_text ON search_documents(text);
@@ -1264,7 +1264,7 @@ fn ensure_chatgpt_schema(conn: &Connection) -> Result<(), String> {
             not_before REAL,
             attempt_count INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(conversation_pk, reason),
-            FOREIGN KEY(conversation_pk) REFERENCES conversations(conversation_pk) ON DELETE CASCADE
+            FOREIGN KEY (conversation_pk) REFERENCES conversations(conversation_pk) ON DELETE CASCADE
         );
         CREATE TABLE IF NOT EXISTS tombstones (
             conversation_pk INTEGER PRIMARY KEY,
@@ -1274,12 +1274,140 @@ fn ensure_chatgpt_schema(conn: &Connection) -> Result<(), String> {
             last_known_title TEXT,
             deleted_or_inaccessible_at REAL NOT NULL,
             reason TEXT NOT NULL
-        );",
+        );
+        CREATE TABLE IF NOT EXISTS service_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS refresh_leases (
+            lease_id TEXT PRIMARY KEY,
+            conversation_pk INTEGER,
+            lease_type TEXT NOT NULL,
+            url TEXT NOT NULL,
+            granted_at REAL NOT NULL,
+            deadline_at REAL NOT NULL,
+            completed_at REAL,
+            status TEXT NOT NULL DEFAULT 'active',
+            last_error TEXT,
+            FOREIGN KEY (conversation_pk) REFERENCES conversations(conversation_pk) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_refresh_leases_status ON refresh_leases(status);
+        ",
     )
     .map_err(|err| format!("chatgpt schema init failed: {err}"))?;
+    // Additive migration for pre-v2 databases that already have a conversations
+    // table with fewer columns. Inspect PRAGMA table_info and ALTER TABLE ADD
+    // COLUMN for any missing nullable/defaulted columns. Never drop/rebuild.
+    migrate_conversations_columns(conn)?;
+    migrate_refresh_queue_columns(conn)?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_refresh_queue_due
+         ON refresh_queue(priority DESC, not_before ASC);",
+    )
+    .map_err(|err| format!("chatgpt schema index init failed: {err}"))?;
     Ok(())
 }
 
+/// Return true if `table` has a column named `column` (case-insensitive).
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, String> {
+    let cols: Vec<String> = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|e| e.to_string())?
+        .query_map([], |r| r.get::<_, String>(1))
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .collect();
+    Ok(cols.iter().any(|c| c.eq_ignore_ascii_case(column)))
+}
+
+/// Add a missing column to an existing table via ALTER TABLE ADD COLUMN.
+fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<(), String> {
+    if !column_exists(conn, table, column)? {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+            [],
+        )
+        .map_err(|e| format!("migrate {table}.{column}: {e}"))?;
+    }
+    Ok(())
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool, String> {
+    let n: i64 = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{table}'"),
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(n > 0)
+}
+
+/// Additively migrate an older `conversations` table to the current column set.
+fn migrate_conversations_columns(conn: &Connection) -> Result<(), String> {
+    if !table_exists(conn, "conversations")? {
+        return Ok(());
+    }
+    ensure_column(conn, "conversations", "title", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "conversations", "created_at_remote", "REAL")?;
+    ensure_column(conn, "conversations", "updated_at_remote", "REAL")?;
+    ensure_column(conn, "conversations", "last_message_at_remote", "REAL")?;
+    ensure_column(conn, "conversations", "last_seen_in_list_at", "REAL")?;
+    ensure_column(conn, "conversations", "last_fetched_at", "REAL")?;
+    ensure_column(conn, "conversations", "last_indexed_at", "REAL")?;
+    ensure_column(conn, "conversations", "current_snapshot_hash", "TEXT")?;
+    ensure_column(
+        conn,
+        "conversations",
+        "freshness_state",
+        "TEXT NOT NULL DEFAULT 'unknown'",
+    )?;
+    ensure_column(
+        conn,
+        "conversations",
+        "priority_bucket",
+        "TEXT NOT NULL DEFAULT 'warm'",
+    )?;
+    ensure_column(conn, "conversations", "etag", "TEXT")?;
+    ensure_column(conn, "conversations", "last_modified", "TEXT")?;
+    ensure_column(conn, "conversations", "remote_version", "TEXT")?;
+    ensure_column(conn, "conversations", "last_error", "TEXT")?;
+    ensure_column(conn, "conversations", "retry_after_at", "REAL")?;
+    ensure_column(
+        conn,
+        "conversations",
+        "consecutive_failures",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "conversations",
+        "visibility_state",
+        "TEXT NOT NULL DEFAULT 'unknown'",
+    )?;
+    Ok(())
+}
+
+/// Additively migrate an older `refresh_queue` table to the current column set.
+fn migrate_refresh_queue_columns(conn: &Connection) -> Result<(), String> {
+    if !table_exists(conn, "refresh_queue")? {
+        return Ok(());
+    }
+    ensure_column(
+        conn,
+        "refresh_queue",
+        "priority",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(conn, "refresh_queue", "not_before", "REAL")?;
+    ensure_column(
+        conn,
+        "refresh_queue",
+        "attempt_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    Ok(())
+}
 fn now_secs() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1988,6 +2116,27 @@ fn chatgpt_doctor(cfg: &Config) -> Result<(), String> {
     println!("tombstones:       {tombstones}");
     println!("refresh_queue:    {queue}");
 
+    let known_not_fetched =
+        count("SELECT COUNT(*) FROM conversations WHERE current_snapshot_hash IS NULL");
+    let queued_refreshes = count("SELECT COUNT(*) FROM refresh_queue");
+    let active_leases = count("SELECT COUNT(*) FROM refresh_leases WHERE status = 'active'");
+    println!("known_not_fetched: {known_not_fetched}");
+    println!("queued_refreshes:  {queued_refreshes}");
+    println!("active_leases:      {active_leases}");
+    let adapter_seen: Option<String> = conn
+        .query_row(
+            "SELECT value FROM service_state WHERE key = 'last_adapter_seen_at'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    match adapter_seen {
+        Some(ts) => println!("adapter_last_seen: {ts}"),
+        None => println!("adapter_last_seen: -"),
+    }
+
     let no_snapshot =
         count("SELECT COUNT(*) FROM conversations WHERE current_snapshot_hash IS NULL");
     let orphan_docs = count(
@@ -2376,7 +2525,11 @@ fn write_response<W: Write>(
     Ok(())
 }
 
-fn cors_preflight_response<W: Write>(writer: &mut W, allowed: bool) -> Result<(), String> {
+fn cors_preflight_response<W: Write>(
+    writer: &mut W,
+    allowed: bool,
+    methods: &str,
+) -> Result<(), String> {
     let (status, reason) = if allowed {
         (204, "No Content")
     } else {
@@ -2386,7 +2539,7 @@ fn cors_preflight_response<W: Write>(writer: &mut W, allowed: bool) -> Result<()
     if allowed {
         resp.push_str("Access-Control-Allow-Origin: https://chatgpt.com\r\n");
         resp.push_str("Access-Control-Allow-Headers: Authorization, Content-Type\r\n");
-        resp.push_str("Access-Control-Allow-Methods: POST, OPTIONS\r\n");
+        resp.push_str(&format!("Access-Control-Allow-Methods: {methods}\r\n"));
         resp.push_str("Vary: Origin\r\n");
     }
     resp.push_str("Content-Length: 0\r\n");
@@ -2453,6 +2606,781 @@ fn handle_ingest(
     Ok((cors, body))
 }
 
+/// Shared bearer-token + ChatGPT-origin check for browser-facing endpoints.
+/// Returns `true` (cors) when the request carried the ChatGPT origin.
+fn check_auth_and_origin(req: &HttpRequest, token: &str) -> Result<bool, (u16, String)> {
+    let origin = req.header("origin");
+    if !chatgpt_origin_ok(origin) {
+        return Err((403, "{\"error\":\"forbidden origin\"}".to_string()));
+    }
+    let provided = bearer_token(req.header("authorization"));
+    if !token_matches(provided.as_deref(), token) {
+        return Err((401, "{\"error\":\"unauthorized\"}".to_string()));
+    }
+    Ok(origin == Some(ALLOWED_ORIGIN))
+}
+
+const LIST_INGEST_MAX_BYTES: usize = 256 * 1024;
+const DIRTY_DEBOUNCE_SECS: f64 = 3.0;
+const OPENED_PRIORITY: i64 = 100;
+const DIRTY_PRIORITY: i64 = 80;
+const LIST_DELTA_PRIORITY: i64 = 50;
+const LEASE_DEADLINE_SECS: f64 = 30.0;
+const LEASE_DEADLINE_MS: i64 = 30000;
+const LEASE_POLL_AFTER_MS: i64 = 5000;
+const MAX_CONSECUTIVE_FAILURES: i64 = 3;
+const REPORT_FALLBACK_429_SECS: f64 = 60.0;
+const AUTH_COOLDOWN_SECS: f64 = 300.0;
+const NOT_FOUND_BACKOFF_SECS: f64 = 300.0;
+const PER_CONV_FAILURE_BACKOFF_SECS: f64 = 60.0;
+
+/// Fields the report endpoint must never accept (ChatGPT response bodies,
+/// headers, or credentials must not be forwarded to the local service).
+const FORBIDDEN_REPORT_FIELDS: &[&str] = &[
+    "body",
+    "response",
+    "html",
+    "json",
+    "headers",
+    "authorization",
+    "cookie",
+    "accessToken",
+];
+
+struct ExistingConv {
+    pk: i64,
+    last_fetched: Option<f64>,
+    snapshot_hash: Option<String>,
+    title: String,
+    created_at: Option<f64>,
+    updated_at: Option<f64>,
+    visibility: String,
+}
+
+struct ListReport {
+    seen: i64,
+    upserted: i64,
+    queued: i64,
+}
+
+/// Extract a scalar string field from a JSON value, ignoring non-strings.
+fn scalar_str(v: &Value) -> Option<&str> {
+    v.as_str()
+}
+
+/// Extract a scalar f64 field, accepting numbers or numeric strings.
+fn scalar_f64(v: &Value) -> Option<f64> {
+    as_f64(v)
+}
+
+/// Extract a scalar bool field, ignoring non-bools.
+fn scalar_bool(v: &Value) -> Option<bool> {
+    v.as_bool()
+}
+
+/// Upsert metadata-only conversation rows from a list ingest. Accepts only
+/// scalar identity/scheduling fields; body-like fields are ignored. Does not
+/// create snapshots, messages, or search_documents. Sets `last_seen_in_list_at`
+/// and queues a detail refresh when the update marker is newer than
+/// `last_fetched_at` or no snapshot exists.
+fn ingest_chatgpt_list(
+    conn: &mut Connection,
+    items: &[Value],
+    account_id: &str,
+    workspace_id: &str,
+) -> Result<ListReport, String> {
+    let now = now_secs();
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let mut seen = 0i64;
+    let mut upserted = 0i64;
+    let mut queued = 0i64;
+    for item in items {
+        let item_obj = match item.as_object() {
+            Some(o) => o,
+            None => continue,
+        };
+        // Identity: prefer `id`, fall back to `conversation_id`. Only scalar
+        // strings are accepted; nested objects/arrays are ignored.
+        let id = item_obj
+            .get("id")
+            .and_then(scalar_str)
+            .or_else(|| item_obj.get("conversation_id").and_then(scalar_str));
+        let Some(id) = id else { continue };
+        seen += 1;
+
+        let title = item_obj.get("title").and_then(scalar_str).unwrap_or("");
+        let create_time = item_obj.get("create_time").and_then(scalar_f64);
+        let update_time = item_obj
+            .get("update_time")
+            .and_then(scalar_f64)
+            .or_else(|| item_obj.get("updated_at").and_then(scalar_f64));
+        let is_archived = item_obj
+            .get("is_archived")
+            .and_then(scalar_bool)
+            .unwrap_or(false);
+        let is_deleted = item_obj
+            .get("is_deleted")
+            .and_then(scalar_bool)
+            .unwrap_or(false);
+        let visibility = if is_deleted {
+            "deleted"
+        } else if is_archived {
+            "archived"
+        } else {
+            "unknown"
+        };
+
+        // Body-like fields (mapping, messages, content, parts, text,
+        // attachments, nested objects/arrays) are intentionally never read.
+
+        let existing = tx
+            .query_row(
+                "SELECT conversation_pk, last_fetched_at, current_snapshot_hash,
+                        title, created_at_remote, updated_at_remote, visibility_state
+                 FROM conversations
+                 WHERE account_id = ?1 AND workspace_id = ?2 AND remote_conversation_id = ?3",
+                params![account_id, workspace_id, id],
+                |row| {
+                    Ok(ExistingConv {
+                        pk: row.get(0)?,
+                        last_fetched: row.get(1)?,
+                        snapshot_hash: row.get(2)?,
+                        title: row.get(3)?,
+                        created_at: row.get(4)?,
+                        updated_at: row.get(5)?,
+                        visibility: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+
+        let pk = match existing {
+            Some(ExistingConv {
+                pk,
+                last_fetched,
+                snapshot_hash,
+                title: old_title,
+                created_at: old_created,
+                updated_at: old_updated,
+                visibility: old_vis,
+            }) => {
+                let changed = old_title != title
+                    || old_created != create_time
+                    || old_updated != update_time
+                    || old_vis != visibility;
+                if changed {
+                    tx.execute(
+                        "UPDATE conversations
+                            SET title = ?1,
+                                created_at_remote = COALESCE(?2, created_at_remote),
+                                updated_at_remote = COALESCE(?3, updated_at_remote),
+                                last_seen_in_list_at = ?4,
+                                visibility_state = ?5
+                         WHERE conversation_pk = ?6",
+                        params![title, create_time, update_time, now, visibility, pk],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    upserted += 1;
+                }
+                let should_queue = snapshot_hash.is_none()
+                    || match (update_time, last_fetched) {
+                        (Some(u), Some(lf)) => u > lf,
+                        (Some(_), None) => true,
+                        (None, _) => snapshot_hash.is_none(),
+                    };
+                if should_queue {
+                    let res = tx
+                        .execute(
+                            "INSERT INTO refresh_queue (conversation_pk, reason, priority, not_before, attempt_count)
+                             VALUES (?1, 'list_delta', ?2, ?3, 0)
+                             ON CONFLICT(conversation_pk, reason) DO UPDATE SET
+                                not_before = MIN(refresh_queue.not_before, excluded.not_before),
+                                priority = MAX(refresh_queue.priority, excluded.priority)",
+                            params![pk, LIST_DELTA_PRIORITY, now],
+                        )
+                        .map_err(|e| e.to_string())?;
+                    if res > 0 {
+                        queued += 1;
+                    }
+                }
+                pk
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO conversations
+                        (account_id, workspace_id, remote_conversation_id, title,
+                         created_at_remote, updated_at_remote, last_seen_in_list_at,
+                         freshness_state, visibility_state)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'unknown', ?8)",
+                    params![
+                        account_id,
+                        workspace_id,
+                        id,
+                        title,
+                        create_time,
+                        update_time,
+                        now,
+                        visibility
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+                let pk = tx.last_insert_rowid();
+                upserted += 1;
+                // New row: no snapshot, so queue a detail refresh.
+                let res = tx
+                    .execute(
+                        "INSERT OR IGNORE INTO refresh_queue
+                            (conversation_pk, reason, priority, not_before, attempt_count)
+                         VALUES (?1, 'list_delta', ?2, ?3, 0)",
+                        params![pk, LIST_DELTA_PRIORITY, now],
+                    )
+                    .map_err(|e| e.to_string())?;
+                if res > 0 {
+                    queued += 1;
+                }
+                pk
+            }
+        };
+        let _ = pk;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(ListReport {
+        seen,
+        upserted,
+        queued,
+    })
+}
+
+/// Parse a conversation id from a SPA navigation URL `https://chatgpt.com/c/{id}`.
+fn parse_navigation_conversation_id(url: &str) -> Option<String> {
+    let scheme_end = url.find("://")?;
+    let after = &url[scheme_end + 3..];
+    let auth_end = after.find(['/', '?', '#']).unwrap_or(after.len());
+    let authority = &after[..auth_end];
+    let origin = format!("{}://{}", &url[..scheme_end], authority);
+    if origin != ALLOWED_ORIGIN {
+        return None;
+    }
+    let path_start = &after[auth_end..];
+    let path = path_start.split(['?', '#'].as_ref()).next().unwrap_or("");
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.len() >= 2 && parts[0] == "c" {
+        return Some(parts[1].to_string());
+    }
+    None
+}
+
+/// Upsert a known conversation row (no snapshot) and return its primary key.
+fn upsert_known_conversation(
+    tx: &Connection,
+    account_id: &str,
+    workspace_id: &str,
+    remote_id: &str,
+    now: f64,
+) -> Result<i64, String> {
+    let pk: Option<i64> = tx
+        .query_row(
+            "SELECT conversation_pk FROM conversations
+             WHERE account_id = ?1 AND workspace_id = ?2 AND remote_conversation_id = ?3",
+            params![account_id, workspace_id, remote_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    match pk {
+        Some(p) => {
+            tx.execute(
+                "UPDATE conversations SET last_seen_in_list_at = ?1 WHERE conversation_pk = ?2",
+                params![now, p],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(p)
+        }
+        None => {
+            tx.execute(
+                "INSERT INTO conversations
+                    (account_id, workspace_id, remote_conversation_id, title,
+                     last_seen_in_list_at, freshness_state, visibility_state)
+                 VALUES (?1, ?2, ?3, '', ?4, 'unknown', 'unknown')",
+                params![account_id, workspace_id, remote_id, now],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(tx.last_insert_rowid())
+        }
+    }
+}
+
+/// Set a `service_state` key/value pair (upsert).
+fn set_service_state(tx: &Connection, key: &str, value: &str) -> Result<(), String> {
+    tx.execute(
+        "INSERT INTO service_state (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Read a `service_state` value as a parsed f64 (0.0 if missing/unparseable).
+fn get_service_state_f64(conn: &Connection, key: &str) -> Result<f64, String> {
+    let v: Option<String> = conn
+        .query_row(
+            "SELECT value FROM service_state WHERE key = ?1",
+            params![key],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    Ok(v.and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0))
+}
+
+/// Enqueue (or coalesce) a detail refresh queue row. When `max_not_before` is
+/// true the latest `not_before` wins (debounce pushes later); otherwise the
+/// earliest wins (more urgent).
+fn enqueue_refresh(
+    tx: &Connection,
+    pk: i64,
+    reason: &str,
+    priority: i64,
+    not_before: f64,
+    max_not_before: bool,
+) -> Result<(), String> {
+    let nb_expr = if max_not_before {
+        "MAX(refresh_queue.not_before, excluded.not_before)"
+    } else {
+        "MIN(refresh_queue.not_before, excluded.not_before)"
+    };
+    let sql = format!(
+        "INSERT INTO refresh_queue (conversation_pk, reason, priority, not_before, attempt_count)
+         VALUES (?1, ?2, ?3, ?4, 0)
+         ON CONFLICT(conversation_pk, reason) DO UPDATE SET
+            not_before = {nb_expr},
+            priority = MAX(refresh_queue.priority, excluded.priority)"
+    );
+    tx.execute(&sql, params![pk, reason, priority, not_before])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Process one ChatGPT browser event. No conversation body text is accepted.
+fn handle_chatgpt_event(
+    conn: &mut Connection,
+    kind: &str,
+    conversation_id: Option<&str>,
+    url: &str,
+    reason: &str,
+    account_id: &str,
+    workspace_id: &str,
+) -> Result<(), String> {
+    let now = now_secs();
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    match kind {
+        "adapter_hello" => {
+            set_service_state(&tx, "last_adapter_seen_at", &now.to_string())?;
+        }
+        "navigation" => {
+            let cid: String = conversation_id
+                .map(|s| s.to_string())
+                .or_else(|| parse_navigation_conversation_id(url))
+                .ok_or_else(|| "navigation event missing conversation_id".to_string())?;
+            let pk = upsert_known_conversation(&tx, account_id, workspace_id, &cid, now)?;
+            enqueue_refresh(&tx, pk, "opened", OPENED_PRIORITY, now, false)?;
+        }
+        "dirty" => {
+            let cid: String = conversation_id
+                .map(|s| s.to_string())
+                .or_else(|| parse_navigation_conversation_id(url))
+                .ok_or_else(|| "dirty event missing conversation_id".to_string())?;
+            let pk = upsert_known_conversation(&tx, account_id, workspace_id, &cid, now)?;
+            let _ = reason;
+            enqueue_refresh(
+                &tx,
+                pk,
+                "dirty",
+                DIRTY_PRIORITY,
+                now + DIRTY_DEBOUNCE_SECS,
+                true,
+            )?;
+        }
+        "delete" | "archive" => {
+            if let Some(cid) = conversation_id {
+                let vis = if kind == "delete" {
+                    "deleted"
+                } else {
+                    "archived"
+                };
+                tx.execute(
+                    "UPDATE conversations SET visibility_state = ?1
+                     WHERE account_id = ?2 AND workspace_id = ?3 AND remote_conversation_id = ?4",
+                    params![vis, account_id, workspace_id, cid],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        other => return Err(format!("unknown event kind: {other}")),
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Generate an unpredictable opaque lease id (16 random bytes hex).
+fn generate_lease_id() -> String {
+    if let Ok(mut file) = fs::File::open("/dev/urandom") {
+        let mut bytes = [0u8; 16];
+        if file.read_exact(&mut bytes).is_ok() {
+            return bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        }
+    }
+    let t = now_secs().to_bits();
+    let pid = std::process::id();
+    let counter = LEASE_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    format!("{t:016x}{pid:08x}{counter:08x}")
+}
+
+static LEASE_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+struct LeaseGrant {
+    lease_id: Option<String>,
+    conversation_id: Option<String>,
+    url: Option<String>,
+    deadline_ms: i64,
+    poll_after_ms: i64,
+}
+
+/// Grant at most one active detail lease globally. Returns `None` (no work)
+/// when a global cooldown is active, an active lease exists, or no due
+/// `refresh_queue` row is available. Per-conversation consecutive failures
+/// >= 3 are skipped.
+fn grant_detail_lease(conn: &mut Connection) -> Result<LeaseGrant, String> {
+    let now = now_secs();
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+
+    let cooldown = get_service_state_f64(&tx, "global_cooldown_until")?;
+    if cooldown > now {
+        let ms = (((cooldown - now) * 1000.0) as i64) + 1000;
+        return Ok(LeaseGrant {
+            lease_id: None,
+            conversation_id: None,
+            url: None,
+            deadline_ms: 0,
+            poll_after_ms: ms.max(1000),
+        });
+    }
+
+    // Expire stale active leases whose deadline has passed.
+    tx.execute(
+        "UPDATE refresh_leases SET status = 'expired'
+         WHERE status = 'active' AND deadline_at < ?1",
+        params![now],
+    )
+    .map_err(|e| e.to_string())?;
+
+    let active: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM refresh_leases WHERE status = 'active'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if active > 0 {
+        return Ok(LeaseGrant {
+            lease_id: None,
+            conversation_id: None,
+            url: None,
+            deadline_ms: 0,
+            poll_after_ms: LEASE_POLL_AFTER_MS,
+        });
+    }
+
+    let row: Option<(i64, String)> = tx
+        .query_row(
+            "SELECT q.conversation_pk, c.remote_conversation_id
+             FROM refresh_queue q
+             JOIN conversations c ON c.conversation_pk = q.conversation_pk
+             WHERE (q.not_before IS NULL OR q.not_before <= ?1)
+               AND c.consecutive_failures < ?2
+             ORDER BY q.priority DESC, q.not_before ASC
+             LIMIT 1",
+            params![now, MAX_CONSECUTIVE_FAILURES],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+
+    let Some((conv_pk, conv_id)) = row else {
+        return Ok(LeaseGrant {
+            lease_id: None,
+            conversation_id: None,
+            url: None,
+            deadline_ms: 0,
+            poll_after_ms: LEASE_POLL_AFTER_MS,
+        });
+    };
+
+    let lease_id = generate_lease_id();
+    let deadline = now + LEASE_DEADLINE_SECS;
+    let url = format!("https://chatgpt.com/backend-api/conversation/{conv_id}");
+    tx.execute(
+        "INSERT INTO refresh_leases
+            (lease_id, conversation_pk, lease_type, url, granted_at, deadline_at, status)
+         VALUES (?1, ?2, 'detail', ?3, ?4, ?5, 'active')",
+        params![lease_id, conv_pk, url, now, deadline],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(LeaseGrant {
+        lease_id: Some(lease_id),
+        conversation_id: Some(conv_id),
+        url: Some(url),
+        deadline_ms: LEASE_DEADLINE_MS,
+        poll_after_ms: 0,
+    })
+}
+
+/// Process a lease report (status metadata only). Never accepts ChatGPT
+/// response bodies, headers, or credentials.
+fn process_lease_report(
+    conn: &mut Connection,
+    lease_id: &str,
+    ok: bool,
+    status: Option<i64>,
+    retry_after_ms: Option<i64>,
+    error: &str,
+) -> Result<(), String> {
+    let now = now_secs();
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+
+    let lease: Option<(Option<i64>, String)> = tx
+        .query_row(
+            "SELECT conversation_pk, status FROM refresh_leases WHERE lease_id = ?1",
+            params![lease_id],
+            |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some((conv_pk_opt, lease_status)) = lease else {
+        return Err("lease not found".to_string());
+    };
+    if lease_status != "active" {
+        return Err("lease is not active".to_string());
+    }
+    let conv_pk = conv_pk_opt.ok_or_else(|| "lease has no conversation".to_string())?;
+
+    if ok {
+        tx.execute(
+            "UPDATE refresh_leases SET status = 'succeeded', completed_at = ?1 WHERE lease_id = ?2",
+            params![now, lease_id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "UPDATE conversations SET consecutive_failures = 0 WHERE conversation_pk = ?1",
+            params![conv_pk],
+        )
+        .map_err(|e| e.to_string())?;
+        // A successful detail fetch satisfies all pending refresh reasons.
+        tx.execute(
+            "DELETE FROM refresh_queue WHERE conversation_pk = ?1",
+            params![conv_pk],
+        )
+        .map_err(|e| e.to_string())?;
+    } else {
+        tx.execute(
+            "UPDATE refresh_leases SET status = 'failed', completed_at = ?1, last_error = ?2
+             WHERE lease_id = ?3",
+            params![now, error, lease_id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "UPDATE conversations SET consecutive_failures = consecutive_failures + 1,
+                                       last_error = ?1
+             WHERE conversation_pk = ?2",
+            params![error, conv_pk],
+        )
+        .map_err(|e| e.to_string())?;
+        let backoff = match status {
+            Some(429) => {
+                let cd = retry_after_ms
+                    .map(|m| m as f64 / 1000.0)
+                    .unwrap_or(REPORT_FALLBACK_429_SECS);
+                set_service_state(&tx, "global_cooldown_until", &(now + cd).to_string())?;
+                PER_CONV_FAILURE_BACKOFF_SECS
+            }
+            Some(401) | Some(403) => {
+                set_service_state(
+                    &tx,
+                    "global_cooldown_until",
+                    &(now + AUTH_COOLDOWN_SECS).to_string(),
+                )?;
+                AUTH_COOLDOWN_SECS
+            }
+            Some(404) => {
+                tx.execute(
+                    "UPDATE conversations SET visibility_state = 'inaccessible'
+                     WHERE conversation_pk = ?1",
+                    params![conv_pk],
+                )
+                .map_err(|e| e.to_string())?;
+                NOT_FOUND_BACKOFF_SECS
+            }
+            _ => PER_CONV_FAILURE_BACKOFF_SECS,
+        };
+        // Push the conversation's queue rows past the backoff window so the
+        // same conversation is not re-leased immediately.
+        tx.execute(
+            "UPDATE refresh_queue SET not_before = ?1 WHERE conversation_pk = ?2",
+            params![now + backoff, conv_pk],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// `POST /ingest/chatgpt/list` handler.
+fn handle_list_ingest(
+    req: &HttpRequest,
+    db_path: &Path,
+    token: &str,
+) -> Result<(bool, String), (u16, String)> {
+    let cors = check_auth_and_origin(req, token)?;
+    if req.body.len() > LIST_INGEST_MAX_BYTES {
+        return Err((413, "{\"error\":\"request body too large\"}".to_string()));
+    }
+    let v: Value = serde_json::from_slice(&req.body)
+        .map_err(|e| (400, format!("{{\"error\":\"invalid JSON: {e}\"}}")))?;
+    let obj = v.as_object().ok_or_else(|| {
+        (
+            400,
+            "{\"error\":\"body must be a JSON object\"}".to_string(),
+        )
+    })?;
+    let account_id = obj
+        .get("account_id")
+        .and_then(|x| x.as_str())
+        .unwrap_or("default");
+    let workspace_id = obj
+        .get("workspace_id")
+        .and_then(|x| x.as_str())
+        .unwrap_or("default");
+    let items = obj
+        .get("items")
+        .and_then(|x| x.as_array())
+        .ok_or_else(|| (400, "{\"error\":\"missing items array\"}".to_string()))?;
+    let mut conn = open_chatgpt_db(db_path).map_err(|e| (500, format!("{{\"error\":\"{e}\"}}")))?;
+    let report = ingest_chatgpt_list(&mut conn, items, account_id, workspace_id)
+        .map_err(|e| (500, format!("{{\"error\":\"{e}\"}}")))?;
+    let body = format!(
+        "{{\"ok\":true,\"seen\":{},\"upserted\":{},\"queued\":{}}}",
+        report.seen, report.upserted, report.queued
+    );
+    Ok((cors, body))
+}
+
+/// `POST /events/chatgpt` handler.
+fn handle_events(
+    req: &HttpRequest,
+    db_path: &Path,
+    token: &str,
+) -> Result<(bool, String), (u16, String)> {
+    let cors = check_auth_and_origin(req, token)?;
+    let v: Value = serde_json::from_slice(&req.body)
+        .map_err(|e| (400, format!("{{\"error\":\"invalid JSON: {e}\"}}")))?;
+    let obj = v.as_object().ok_or_else(|| {
+        (
+            400,
+            "{\"error\":\"body must be a JSON object\"}".to_string(),
+        )
+    })?;
+    let kind = obj
+        .get("kind")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| (400, "{\"error\":\"missing kind\"}".to_string()))?;
+    let account_id = obj
+        .get("account_id")
+        .and_then(|x| x.as_str())
+        .unwrap_or("default");
+    let workspace_id = obj
+        .get("workspace_id")
+        .and_then(|x| x.as_str())
+        .unwrap_or("default");
+    let conversation_id = obj.get("conversation_id").and_then(|x| x.as_str());
+    let url = obj.get("url").and_then(|x| x.as_str()).unwrap_or("");
+    let reason = obj.get("reason").and_then(|x| x.as_str()).unwrap_or("");
+    let mut conn = open_chatgpt_db(db_path).map_err(|e| (500, format!("{{\"error\":\"{e}\"}}")))?;
+    handle_chatgpt_event(
+        &mut conn,
+        kind,
+        conversation_id,
+        url,
+        reason,
+        account_id,
+        workspace_id,
+    )
+    .map_err(|e| (400, format!("{{\"error\":\"{e}\"}}")))?;
+    Ok((cors, "{\"ok\":true}".to_string()))
+}
+
+/// `GET /refresh/chatgpt/lease` handler.
+fn handle_lease(
+    req: &HttpRequest,
+    db_path: &Path,
+    token: &str,
+) -> Result<(bool, String), (u16, String)> {
+    let cors = check_auth_and_origin(req, token)?;
+    let mut conn = open_chatgpt_db(db_path).map_err(|e| (500, format!("{{\"error\":\"{e}\"}}")))?;
+    let grant =
+        grant_detail_lease(&mut conn).map_err(|e| (500, format!("{{\"error\":\"{e}\"}}")))?;
+    let body = match grant.lease_id {
+        Some(id) => format!(
+            "{{\"ok\":true,\"lease\":{{\"lease_id\":\"{}\",\"type\":\"detail\",\"conversation_id\":\"{}\",\"url\":\"{}\",\"deadline_ms\":{}}}}}",
+            id,
+            grant.conversation_id.unwrap_or_default(),
+            grant.url.unwrap_or_default(),
+            grant.deadline_ms
+        ),
+        None => format!(
+            "{{\"ok\":true,\"lease\":null,\"poll_after_ms\":{}}}",
+            grant.poll_after_ms
+        ),
+    };
+    Ok((cors, body))
+}
+
+/// `POST /refresh/chatgpt/report` handler.
+fn handle_report(
+    req: &HttpRequest,
+    db_path: &Path,
+    token: &str,
+) -> Result<(bool, String), (u16, String)> {
+    let cors = check_auth_and_origin(req, token)?;
+    let v: Value = serde_json::from_slice(&req.body)
+        .map_err(|e| (400, format!("{{\"error\":\"invalid JSON: {e}\"}}")))?;
+    let obj = v.as_object().ok_or_else(|| {
+        (
+            400,
+            "{\"error\":\"body must be a JSON object\"}".to_string(),
+        )
+    })?;
+    for f in FORBIDDEN_REPORT_FIELDS {
+        if obj.contains_key(*f) {
+            return Err((400, format!("{{\"error\":\"forbidden field: {f}\"}}")));
+        }
+    }
+    let lease_id = obj
+        .get("lease_id")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| (400, "{\"error\":\"missing lease_id\"}".to_string()))?;
+    let ok = obj.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
+    let status = obj.get("status").and_then(|x| x.as_i64());
+    let retry_after_ms = obj.get("retry_after_ms").and_then(|x| x.as_i64());
+    let error = obj.get("error").and_then(|x| x.as_str()).unwrap_or("");
+    let mut conn = open_chatgpt_db(db_path).map_err(|e| (500, format!("{{\"error\":\"{e}\"}}")))?;
+    process_lease_report(&mut conn, lease_id, ok, status, retry_after_ms, error)
+        .map_err(|e| (400, format!("{{\"error\":\"{e}\"}}")))?;
+    Ok((cors, "{\"ok\":true}".to_string()))
+}
+
 /// Run the chatgpt-serve loopback ingest service until interrupted.
 fn chatgpt_serve(cfg: &Config, addr: &str, token_file: &Path) -> Result<(), String> {
     ensure_token_file(token_file)?;
@@ -2496,35 +3424,74 @@ fn serve_one(stream: std::net::TcpStream, db_path: &Path, token: &str) -> Result
         .map_err(|err| format!("set timeout: {err}"))?;
     let mut reader = std::io::BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
     let req = read_request(&mut reader)?;
-    let path_only = req.target.split(['?', '#'].as_ref()).next().unwrap_or("");
-    let _ = path_only;
     let (path_no_query, _query) = match req.target.split_once('?') {
         Some((p, q)) => (p, Some(q)),
         None => (req.target.as_str(), None),
     };
     let path_no_query = path_no_query.split('#').next().unwrap_or(path_no_query);
     let mut writer = stream;
+    let origin = req.header("origin");
+    let origin_ok = chatgpt_origin_ok(origin);
+    let cors_origin = origin == Some(ALLOWED_ORIGIN);
     match (req.method.as_str(), path_no_query) {
         ("GET", "/health") => handle_health(&mut writer),
+        // Conversation detail ingest
         ("OPTIONS", "/ingest/chatgpt/conversation") => {
-            let origin = req.header("origin");
-            let allowed = chatgpt_origin_ok(origin);
-            cors_preflight_response(&mut writer, allowed)
+            cors_preflight_response(&mut writer, origin_ok, "POST, OPTIONS")
         }
         ("POST", "/ingest/chatgpt/conversation") => match handle_ingest(&req, db_path, token) {
-            Ok((cors, body)) => {
-                let status = 200u16;
-                write_response(&mut writer, status, "OK", cors, &body)
-            }
+            Ok((cors, body)) => write_response(&mut writer, 200, "OK", cors, &body),
             Err((status, body)) => {
-                let reason = match status {
-                    400 => "Bad Request",
-                    401 => "Unauthorized",
-                    403 => "Forbidden",
-                    500 => "Internal Server Error",
-                    _ => "Error",
-                };
+                let reason = http_reason(status);
                 write_response(&mut writer, status, reason, false, &body)
+            }
+        },
+        // List metadata ingest
+        ("OPTIONS", "/ingest/chatgpt/list") => {
+            cors_preflight_response(&mut writer, origin_ok, "POST, OPTIONS")
+        }
+        ("POST", "/ingest/chatgpt/list") => match handle_list_ingest(&req, db_path, token) {
+            Ok((cors, body)) => write_response(&mut writer, 200, "OK", cors, &body),
+            Err((status, body)) => {
+                let reason = http_reason(status);
+                let cors = if status == 403 { cors_origin } else { false };
+                write_response(&mut writer, status, reason, cors, &body)
+            }
+        },
+        // Browser events
+        ("OPTIONS", "/events/chatgpt") => {
+            cors_preflight_response(&mut writer, origin_ok, "POST, OPTIONS")
+        }
+        ("POST", "/events/chatgpt") => match handle_events(&req, db_path, token) {
+            Ok((cors, body)) => write_response(&mut writer, 200, "OK", cors, &body),
+            Err((status, body)) => {
+                let reason = http_reason(status);
+                let cors = if status == 403 { cors_origin } else { false };
+                write_response(&mut writer, status, reason, cors, &body)
+            }
+        },
+        // Refresh lease
+        ("OPTIONS", "/refresh/chatgpt/lease") => {
+            cors_preflight_response(&mut writer, origin_ok, "GET, OPTIONS")
+        }
+        ("GET", "/refresh/chatgpt/lease") => match handle_lease(&req, db_path, token) {
+            Ok((cors, body)) => write_response(&mut writer, 200, "OK", cors, &body),
+            Err((status, body)) => {
+                let reason = http_reason(status);
+                let cors = if status == 403 { cors_origin } else { false };
+                write_response(&mut writer, status, reason, cors, &body)
+            }
+        },
+        // Refresh report
+        ("OPTIONS", "/refresh/chatgpt/report") => {
+            cors_preflight_response(&mut writer, origin_ok, "POST, OPTIONS")
+        }
+        ("POST", "/refresh/chatgpt/report") => match handle_report(&req, db_path, token) {
+            Ok((cors, body)) => write_response(&mut writer, 200, "OK", cors, &body),
+            Err((status, body)) => {
+                let reason = http_reason(status);
+                let cors = if status == 403 { cors_origin } else { false };
+                write_response(&mut writer, status, reason, cors, &body)
             }
         },
         _ => write_response(
@@ -2537,6 +3504,18 @@ fn serve_one(stream: std::net::TcpStream, db_path: &Path, token: &str) -> Result
     }
 }
 
+/// Map an HTTP status code to its reason phrase for error responses.
+fn http_reason(status: u16) -> &'static str {
+    match status {
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        413 => "Payload Too Large",
+        500 => "Internal Server Error",
+        _ => "Error",
+    }
+}
 /// Print or install the ChatGPT browser userscript (two pieces).
 fn chatgpt_userscript(
     _cfg: &Config,
@@ -3117,12 +4096,26 @@ fn main_world_code() -> String {
   "use strict";
   var ALLOWED_ORIGIN = "https://chatgpt.com";
   var ROUTE_RE = /^\/backend-api\/conversation\/[^\/?#]+\/?$/;
+  var LIST_RE = /^\/backend-api\/conversations\/?$/;
   function isConversationUrl(raw) {
     try {
       var u = new URL(raw);
       if (u.origin !== ALLOWED_ORIGIN) return false;
       return ROUTE_RE.test(u.pathname);
     } catch (e) { return false; }
+  }
+  function isListUrl(raw) {
+    try {
+      var u = new URL(raw);
+      if (u.origin !== ALLOWED_ORIGIN) return false;
+      return LIST_RE.test(u.pathname);
+    } catch (e) { return false; }
+  }
+  function currentConversationId() {
+    try {
+      var m = location.pathname.match(/^\/c\/([^\/?#]+)/);
+      return m ? m[1] : "";
+    } catch (e) { return ""; }
   }
   function guardPayload(p) {
     return p && typeof p === "object" && !Array.isArray(p)
@@ -3140,10 +4133,79 @@ fn main_world_code() -> String {
       window.postMessage({ type: "chat-memory-capture", detail: detail }, ALLOWED_ORIGIN);
     } catch (e) {}
   }
+  function listItems(data) {
+    if (Array.isArray(data)) return data;
+    if (!data || typeof data !== "object") return [];
+    if (Array.isArray(data.items)) return data.items;
+    if (Array.isArray(data.conversations)) return data.conversations;
+    if (Array.isArray(data.data)) return data.data;
+    return [];
+  }
+  function scalar(v) {
+    return (typeof v === "string" || typeof v === "number" || typeof v === "boolean") ? v : undefined;
+  }
+  function reduceList(data) {
+    var out = [];
+    var items = listItems(data);
+    for (var i = 0; i < items.length && out.length < 50; i++) {
+      var it = items[i];
+      if (!it || typeof it !== "object" || Array.isArray(it)) continue;
+      var id = scalar(it.id);
+      if (id === undefined) id = scalar(it.conversation_id);
+      if (typeof id !== "string") continue;
+      var row = { id: id };
+      ["conversation_id","title","create_time","update_time","updated_at","is_archived","is_deleted","account_id","workspace_id"].forEach(function (k) {
+        var v = scalar(it[k]);
+        if (v !== undefined) row[k] = v;
+      });
+      out.push(row);
+    }
+    return out;
+  }
+  function emitList(data, url) {
+    try {
+      var items = reduceList(data);
+      if (!items.length) return;
+      var detail = { url: url, items: items, source: "userscript:list-capture", account_id: "default", workspace_id: "default" };
+      window.dispatchEvent(new CustomEvent("chat-memory-list", { detail: detail }));
+      window.postMessage({ type: "chat-memory-list", detail: detail }, ALLOWED_ORIGIN);
+    } catch (e) {}
+  }
+  function emitEvent(kind, extra) {
+    try {
+      var detail = extra || {};
+      detail.kind = kind;
+      if (!detail.url) detail.url = location.href;
+      if (!detail.conversation_id) detail.conversation_id = currentConversationId();
+      detail.account_id = detail.account_id || "default";
+      detail.workspace_id = detail.workspace_id || "default";
+      window.dispatchEvent(new CustomEvent("chat-memory-event", { detail: detail }));
+      window.postMessage({ type: "chat-memory-event", detail: detail }, ALLOWED_ORIGIN);
+    } catch (e) {}
+  }
+  function emitNavigation() {
+    var id = currentConversationId();
+    if (id) emitEvent("navigation", { conversation_id: id, reason: "opened" });
+  }
+  function maybeDirty(method, rawUrl, status) {
+    try {
+      if (!(status >= 200 && status < 300)) return;
+      method = String(method || "GET").toUpperCase();
+      if (method === "GET" || method === "HEAD" || method === "OPTIONS") return;
+      var u = new URL(rawUrl, location.href);
+      if (u.origin !== ALLOWED_ORIGIN) return;
+      if (!/^\/backend-api\//.test(u.pathname)) return;
+      var id = currentConversationId();
+      if (id) emitEvent("dirty", { conversation_id: id, reason: "mutation_observed" });
+    } catch (e) {}
+  }
   function hookFetch() {
     var orig = window.fetch;
     if (!orig) return;
     window.fetch = function () {
+      var input = arguments[0], init = arguments[1] || {};
+      var rawUrl = (typeof input === "string") ? input : (input && input.url) || "";
+      var method = init.method || (input && input.method) || "GET";
       var p = orig.apply(this, arguments);
       p.then(function (resp) {
         try {
@@ -3151,7 +4213,12 @@ fn main_world_code() -> String {
             resp.clone().json().then(function (data) {
               if (guardPayload(data)) emit(data, resp.url);
             }).catch(function () {});
+          } else if (isListUrl(resp.url)) {
+            resp.clone().json().then(function (data) {
+              emitList(data, resp.url);
+            }).catch(function () {});
           }
+          maybeDirty(method, resp.url || rawUrl, resp.status);
         } catch (e) {}
       }).catch(function () {});
       return p;
@@ -3163,6 +4230,7 @@ fn main_world_code() -> String {
     var oOpen = XHR.prototype.open, oSend = XHR.prototype.send;
     XHR.prototype.open = function (m, url) {
       this.__cm_url = url;
+      this.__cm_method = m;
       return oOpen.apply(this, arguments);
     };
     XHR.prototype.send = function () {
@@ -3172,14 +4240,37 @@ fn main_world_code() -> String {
           if (isConversationUrl(self.__cm_url)) {
             var data = JSON.parse(self.responseText);
             if (guardPayload(data)) emit(data, self.__cm_url);
+          } else if (isListUrl(self.__cm_url)) {
+            emitList(JSON.parse(self.responseText), self.__cm_url);
           }
+          maybeDirty(self.__cm_method, self.__cm_url, self.status);
         } catch (e) {}
       });
       return oSend.apply(this, arguments);
     };
   }
+  function hookNavigation() {
+    var oPush = history.pushState, oReplace = history.replaceState;
+    history.pushState = function () {
+      var r = oPush.apply(this, arguments);
+      setTimeout(emitNavigation, 0);
+      return r;
+    };
+    history.replaceState = function () {
+      var r = oReplace.apply(this, arguments);
+      setTimeout(emitNavigation, 0);
+      return r;
+    };
+    window.addEventListener("popstate", function () { setTimeout(emitNavigation, 0); });
+    window.addEventListener("hashchange", function () { setTimeout(emitNavigation, 0); });
+    setTimeout(function () {
+      emitEvent("adapter_hello", {});
+      emitNavigation();
+    }, 0);
+  }
   hookFetch();
   hookXHR();
+  hookNavigation();
 })();
 "#
     .to_string()
@@ -3206,8 +4297,12 @@ fn sender_code(server: &str, token: &str) -> String {
   var TOKEN = "{token_esc}";
   var ALLOWED_ORIGIN = "https://chatgpt.com";
   var ROUTE_RE = /^\/backend-api\/conversation\/[^\/?#]+\/?$/;
+  var LIST_RE = /^\/backend-api\/conversations\/?$/;
+  var MAX_DETAIL_LEASES_PER_TAB = 20;
   var failures = 0;
   var stopped = false;
+  var leaseBusy = false;
+  var leaseCount = 0;
   function isConversationUrl(raw) {{
     try {{
       var u = new URL(raw);
@@ -3215,10 +4310,38 @@ fn sender_code(server: &str, token: &str) -> String {
       return ROUTE_RE.test(u.pathname);
     }} catch (e) {{ return false; }}
   }}
+  function isListUrl(raw) {{
+    try {{
+      var u = new URL(raw);
+      if (u.origin !== ALLOWED_ORIGIN) return false;
+      return LIST_RE.test(u.pathname);
+    }} catch (e) {{ return false; }}
+  }}
   function guardPayload(p) {{
     return p && typeof p === "object" && !Array.isArray(p)
       && p.mapping && typeof p.mapping === "object"
       && (typeof p.id === "string" || typeof p.conversation_id === "string");
+  }}
+  function scalar(v) {{
+    return (typeof v === "string" || typeof v === "number" || typeof v === "boolean") ? v : undefined;
+  }}
+  function reduceListItems(items) {{
+    var out = [];
+    if (!Array.isArray(items)) return out;
+    for (var i = 0; i < items.length && out.length < 50; i++) {{
+      var it = items[i];
+      if (!it || typeof it !== "object" || Array.isArray(it)) continue;
+      var id = scalar(it.id);
+      if (id === undefined) id = scalar(it.conversation_id);
+      if (typeof id !== "string") continue;
+      var row = {{ id: id }};
+      ["conversation_id","title","create_time","update_time","updated_at","is_archived","is_deleted","account_id","workspace_id"].forEach(function (k) {{
+        var v = scalar(it[k]);
+        if (v !== undefined) row[k] = v;
+      }});
+      out.push(row);
+    }}
+    return out;
   }}
   function noteFailure(status) {{
     failures += 1;
@@ -3229,7 +4352,15 @@ fn sender_code(server: &str, token: &str) -> String {
       console.warn("[chat-memory] local ingest failed (" + status + "); attempt " + failures);
     }}
   }}
-  function post(detail) {{
+  function localFetch(path, opts) {{
+    opts = opts || {{}};
+    opts.mode = "cors";
+    opts.headers = opts.headers || {{}};
+    opts.headers["Authorization"] = "Bearer " + TOKEN;
+    if (opts.body !== undefined) opts.headers["Content-Type"] = "application/json";
+    return fetch(SERVER + path, opts);
+  }}
+  function postCapture(detail) {{
     if (stopped) return;
     if (!detail || typeof detail !== "object") return;
     // Trust boundary: page events are untrusted. Re-validate route and payload.
@@ -3249,24 +4380,151 @@ fn sender_code(server: &str, token: &str) -> String {
       payload: payload
     }};
     try {{
-      fetch(SERVER + "/ingest/chatgpt/conversation", {{
+      localFetch("/ingest/chatgpt/conversation", {{
         method: "POST",
-        mode: "cors",
-        headers: {{ "Authorization": "Bearer " + TOKEN, "Content-Type": "application/json" }},
         body: JSON.stringify(body)
       }}).then(function (r) {{
         if (r.status >= 200 && r.status < 300) failures = 0; else noteFailure(r.status);
       }}).catch(function () {{ noteFailure(0); }});
     }} catch (e) {{ noteFailure(0); }}
   }}
+  function postList(detail) {{
+    if (stopped || !detail || typeof detail !== "object") return;
+    var url = typeof detail.url === "string" ? detail.url : "";
+    if (!isListUrl(url)) return;
+    var items = reduceListItems(detail.items);
+    if (!items.length) return;
+    var body = {{
+      account_id: typeof detail.account_id === "string" ? detail.account_id : "default",
+      workspace_id: typeof detail.workspace_id === "string" ? detail.workspace_id : "default",
+      source: "userscript:list-capture",
+      items: items
+    }};
+    try {{
+      localFetch("/ingest/chatgpt/list", {{ method: "POST", body: JSON.stringify(body) }})
+        .then(function (r) {{ if (r.status >= 200 && r.status < 300) failures = 0; else noteFailure(r.status); }})
+        .catch(function () {{ noteFailure(0); }});
+    }} catch (e) {{ noteFailure(0); }}
+  }}
+  function postEvent(detail) {{
+    if (stopped || !detail || typeof detail !== "object") return;
+    var kind = typeof detail.kind === "string" ? detail.kind : "";
+    if (["navigation","dirty","adapter_hello"].indexOf(kind) < 0) return;
+    var body = {{
+      kind: kind,
+      account_id: typeof detail.account_id === "string" ? detail.account_id : "default",
+      workspace_id: typeof detail.workspace_id === "string" ? detail.workspace_id : "default"
+    }};
+    if (typeof detail.conversation_id === "string") body.conversation_id = detail.conversation_id;
+    if (typeof detail.url === "string") body.url = detail.url;
+    if (typeof detail.reason === "string") body.reason = detail.reason;
+    try {{
+      localFetch("/events/chatgpt", {{ method: "POST", body: JSON.stringify(body) }})
+        .then(function (r) {{ if (r.status >= 200 && r.status < 300) failures = 0; else noteFailure(r.status); }})
+        .catch(function () {{ noteFailure(0); }});
+    }} catch (e) {{ noteFailure(0); }}
+  }}
+  function retryAfterMs(resp) {{
+    try {{
+      var h = resp.headers.get("Retry-After");
+      if (!h) return undefined;
+      var n = Number(h);
+      if (Number.isFinite(n)) return Math.max(0, Math.floor(n * 1000));
+    }} catch (e) {{}}
+    return undefined;
+  }}
+  function reportLease(leaseId, ok, status, error, retryMs) {{
+    var body = {{ lease_id: leaseId, ok: !!ok }};
+    if (typeof status === "number") body.status = status;
+    if (typeof error === "string" && error) body.error = error.slice(0, 120);
+    if (typeof retryMs === "number") body.retry_after_ms = retryMs;
+    return localFetch("/refresh/chatgpt/report", {{ method: "POST", body: JSON.stringify(body) }})
+      .then(function (r) {{ if (!(r.status >= 200 && r.status < 300)) noteFailure(r.status); }})
+      .catch(function () {{ noteFailure(0); }});
+  }}
+  function runLease(lease) {{
+    if (!lease || lease.type !== "detail" || typeof lease.lease_id !== "string" || !isConversationUrl(lease.url)) return;
+    if (leaseCount >= MAX_DETAIL_LEASES_PER_TAB) return;
+    leaseCount += 1;
+    fetch(lease.url, {{ method: "GET", credentials: "include" }})
+      .then(function (resp) {{
+        if (!(resp.status >= 200 && resp.status < 300)) {{
+          return reportLease(lease.lease_id, false, resp.status, "detail_fetch_failed", retryAfterMs(resp));
+        }}
+        return resp.clone().json().then(function (data) {{
+          if (!guardPayload(data)) return reportLease(lease.lease_id, false, resp.status, "invalid_detail_payload");
+          return new Promise(function (resolve) {{
+            postCapture({{
+              payload: data,
+              url: lease.url,
+              route: lease.url,
+              source: "userscript:refresh",
+              account_id: "default",
+              workspace_id: "default"
+            }});
+            setTimeout(resolve, 0);
+          }}).then(function () {{
+            return reportLease(lease.lease_id, true, resp.status, "");
+          }});
+        }}).catch(function () {{
+          return reportLease(lease.lease_id, false, resp.status, "detail_json_parse_failed");
+        }});
+      }})
+      .catch(function () {{
+        return reportLease(lease.lease_id, false, 0, "detail_fetch_network_error");
+      }});
+  }}
+  function pollLease(delay) {{
+    if (stopped) return;
+    if (leaseBusy || leaseCount >= MAX_DETAIL_LEASES_PER_TAB) {{
+      setTimeout(function () {{ pollLease(5000); }}, 5000);
+      return;
+    }}
+    leaseBusy = true;
+    localFetch("/refresh/chatgpt/lease", {{ method: "GET" }})
+      .then(function (r) {{
+        if (!(r.status >= 200 && r.status < 300)) {{
+          noteFailure(r.status);
+          return {{ poll_after_ms: 10000 }};
+        }}
+        failures = 0;
+        return r.json();
+      }})
+      .then(function (data) {{
+        var next = (data && typeof data.poll_after_ms === "number") ? data.poll_after_ms : 5000;
+        if (data && data.lease) {{
+          runLease(data.lease);
+          next = 1000;
+        }}
+        leaseBusy = false;
+        setTimeout(function () {{ pollLease(next); }}, Math.max(1000, next));
+      }})
+      .catch(function () {{
+        leaseBusy = false;
+        noteFailure(0);
+        setTimeout(function () {{ pollLease(10000); }}, 10000);
+      }});
+  }}
   window.addEventListener("chat-memory-capture", function (e) {{
     if (!e || e.type !== "chat-memory-capture") return;
-    post(e.detail);
+    postCapture(e.detail);
+  }}, false);
+  window.addEventListener("chat-memory-list", function (e) {{
+    if (!e || e.type !== "chat-memory-list") return;
+    postList(e.detail);
+  }}, false);
+  window.addEventListener("chat-memory-event", function (e) {{
+    if (!e || e.type !== "chat-memory-event") return;
+    postEvent(e.detail);
   }}, false);
   window.addEventListener("message", function (e) {{
     if (e.source !== window) return;
-    if (e.data && e.data.type === "chat-memory-capture" && e.data.detail) post(e.data.detail);
+    if (e.data && e.data.type === "chat-memory-capture" && e.data.detail) postCapture(e.data.detail);
+    if (e.data && e.data.type === "chat-memory-list" && e.data.detail) postList(e.data.detail);
+    if (e.data && e.data.type === "chat-memory-event" && e.data.detail) postEvent(e.data.detail);
   }}, false);
+  try {{ postEvent({{ kind: "adapter_hello" }}); }} catch (e) {{}}
+  setTimeout(function () {{ pollLease(1000); }}, 1000);
 }})();
 "#
     )
@@ -3522,14 +4780,14 @@ mod chatgpt_tests {
     #[test]
     fn cors_preflight_allows_only_chatgpt_origin() {
         let mut allowed = Vec::new();
-        cors_preflight_response(&mut allowed, true).unwrap();
+        cors_preflight_response(&mut allowed, true, "POST, OPTIONS").unwrap();
         let allowed = String::from_utf8(allowed).unwrap();
         assert!(allowed.starts_with("HTTP/1.1 204"));
         assert!(allowed.contains("Access-Control-Allow-Origin: https://chatgpt.com"));
         assert!(allowed.contains("Access-Control-Allow-Headers: Authorization, Content-Type"));
 
         let mut denied = Vec::new();
-        cors_preflight_response(&mut denied, false).unwrap();
+        cors_preflight_response(&mut denied, false, "POST, OPTIONS").unwrap();
         let denied = String::from_utf8(denied).unwrap();
         assert!(denied.starts_with("HTTP/1.1 403"));
         assert!(!denied.contains("Access-Control-Allow-Origin"));
@@ -3728,6 +4986,7 @@ mod chatgpt_tests {
         let code = sender_code("http://127.0.0.1:37531", token);
         // route guard repeated in sender
         assert!(code.contains("isConversationUrl"));
+        assert!(code.contains("isListUrl"));
         assert!(code.contains("ROUTE_RE"));
         assert!(code.contains("backend-api") && code.contains("conversation"));
         // payload guard repeated in sender
@@ -3735,11 +4994,37 @@ mod chatgpt_tests {
         assert!(code.contains("mapping"));
         // re-validation happens before the POST
         let guard_pos = code.find("if (!guardPayload(payload))").unwrap();
-        let fetch_pos = code.find("fetch(").unwrap();
-        assert!(guard_pos < fetch_pos, "payload guard must run before fetch");
+        let post_pos = code.find("/ingest/chatgpt/conversation").unwrap();
+        assert!(guard_pos < post_pos, "payload guard must run before ingest");
         // only the local token is forwarded; no page cookie/header forwarding
-        assert!(code.contains("\"Authorization\": \"Bearer \" + TOKEN"));
+        assert!(code.contains("opts.headers[\"Authorization\"] = \"Bearer \" + TOKEN"));
         assert!(!code.contains("document.cookie"));
+    }
+
+    #[test]
+    fn userscript_adapter_calls_refresh_endpoints_and_discards_error_bodies() {
+        let main = main_world_code();
+        let sender = sender_code("http://127.0.0.1:37531", "tok");
+
+        assert!(main.contains("chat-memory-list"));
+        assert!(main.contains("chat-memory-event"));
+        assert!(main.contains("emitNavigation"));
+        assert!(main.contains("maybeDirty"));
+        assert!(main.contains("reduceList"));
+
+        assert!(sender.contains("/ingest/chatgpt/list"));
+        assert!(sender.contains("/events/chatgpt"));
+        assert!(sender.contains("/refresh/chatgpt/lease"));
+        assert!(sender.contains("/refresh/chatgpt/report"));
+        assert!(sender.contains("MAX_DETAIL_LEASES_PER_TAB = 20"));
+        assert!(sender.contains("reduceListItems"));
+        assert!(sender.contains("reportLease(lease.lease_id, false, resp.status"));
+        assert!(sender.contains("if (!(resp.status >= 200 && resp.status < 300))"));
+        assert!(
+            !sender.contains("responseText"),
+            "sender must not forward XHR response bodies"
+        );
+        assert!(!sender.contains("document.cookie"));
     }
 
     #[test]
@@ -3947,5 +5232,743 @@ mod chatgpt_tests {
         let err_body = br#"{"jsonrpc":"2.0","id":1,"error":{"message":"boom"}}"#;
         let err = parse_mcp_response(&headers, err_body).unwrap_err();
         assert!(err.contains("boom"));
+    }
+    // ---------- Slice 1a / 2a helpers and tests ----------
+
+    fn open_test_conn(db: &Path) -> Connection {
+        open_chatgpt_db(db).unwrap()
+    }
+
+    fn list_request(body: &str, auth: Option<&str>, origin: Option<&str>) -> HttpRequest {
+        let mut headers = Vec::new();
+        if let Some(a) = auth {
+            headers.push(("Authorization".to_string(), a.to_string()));
+        }
+        if let Some(o) = origin {
+            headers.push(("Origin".to_string(), o.to_string()));
+        }
+        HttpRequest {
+            method: "POST".to_string(),
+            target: "/ingest/chatgpt/list".to_string(),
+            headers,
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    fn event_request(body: &str, auth: Option<&str>, origin: Option<&str>) -> HttpRequest {
+        let mut headers = Vec::new();
+        if let Some(a) = auth {
+            headers.push(("Authorization".to_string(), a.to_string()));
+        }
+        if let Some(o) = origin {
+            headers.push(("Origin".to_string(), o.to_string()));
+        }
+        HttpRequest {
+            method: "POST".to_string(),
+            target: "/events/chatgpt".to_string(),
+            headers,
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    fn lease_request(auth: Option<&str>, origin: Option<&str>) -> HttpRequest {
+        let mut headers = Vec::new();
+        if let Some(a) = auth {
+            headers.push(("Authorization".to_string(), a.to_string()));
+        }
+        if let Some(o) = origin {
+            headers.push(("Origin".to_string(), o.to_string()));
+        }
+        HttpRequest {
+            method: "GET".to_string(),
+            target: "/refresh/chatgpt/lease".to_string(),
+            headers,
+            body: Vec::new(),
+        }
+    }
+
+    fn report_request(body: &str, auth: Option<&str>, origin: Option<&str>) -> HttpRequest {
+        let mut headers = Vec::new();
+        if let Some(a) = auth {
+            headers.push(("Authorization".to_string(), a.to_string()));
+        }
+        if let Some(o) = origin {
+            headers.push(("Origin".to_string(), o.to_string()));
+        }
+        HttpRequest {
+            method: "POST".to_string(),
+            target: "/refresh/chatgpt/report".to_string(),
+            headers,
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    fn err_status(res: Result<(bool, String), (u16, String)>) -> u16 {
+        res.unwrap_err().0
+    }
+
+    #[test]
+    fn additive_migration_from_minimal_pre_v2_db() {
+        let db = temp_db();
+        // Create a minimal pre-v2 conversations table with only the core columns.
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE conversations (
+                    conversation_pk INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id TEXT NOT NULL,
+                    workspace_id TEXT NOT NULL,
+                    remote_conversation_id TEXT NOT NULL,
+                    UNIQUE(account_id, workspace_id, remote_conversation_id)
+                );
+                CREATE TABLE refresh_queue (
+                    conversation_pk INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    PRIMARY KEY(conversation_pk, reason)
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO conversations (account_id, workspace_id, remote_conversation_id)
+                 VALUES ('a','w','old-1')",
+                [],
+            )
+            .unwrap();
+        }
+        // Now open via the real schema path; migration must add missing columns.
+        let conn = open_test_conn(&db);
+        // The new columns should exist and have defaults.
+        let (vis, fresh, failures): (String, String, i64) = conn
+            .query_row(
+                "SELECT visibility_state, freshness_state, consecutive_failures
+                 FROM conversations WHERE remote_conversation_id = 'old-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(vis, "unknown");
+        assert_eq!(fresh, "unknown");
+        assert_eq!(failures, 0);
+        // New tables exist.
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM service_state", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM refresh_leases", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+        // refresh_queue gained columns.
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(refresh_queue)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert!(cols.iter().any(|c| c == "priority"));
+        assert!(cols.iter().any(|c| c == "not_before"));
+        assert!(cols.iter().any(|c| c == "attempt_count"));
+    }
+
+    #[test]
+    fn list_ingest_upserts_metadata_and_does_not_create_snapshots_or_docs() {
+        let db = temp_db();
+        let body = serde_json::json!({
+            "source": "userscript:list-capture",
+            "account_id": "acct",
+            "workspace_id": "ws",
+            "items": [
+                {"id": "conv-a", "title": "Alpha", "create_time": 100.0, "update_time": 200.0},
+                {"id": "conv-b", "title": "Beta", "update_time": 300.0},
+            ]
+        })
+        .to_string();
+        let req = list_request(&body, Some("Bearer secret"), Some(ALLOWED_ORIGIN));
+        let (cors, resp) = handle_list_ingest(&req, &db, "secret").unwrap();
+        assert!(cors);
+        assert!(resp.contains("\"ok\":true"));
+        assert!(resp.contains("\"seen\":2"));
+        assert!(resp.contains("\"upserted\":2"));
+        assert!(resp.contains("\"queued\":2"));
+
+        let conn = open_test_conn(&db);
+        let convs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(convs, 2);
+        let snaps: i64 = conn
+            .query_row("SELECT COUNT(*) FROM conversation_snapshots", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(snaps, 0);
+        let docs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM search_documents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(docs, 0);
+        let queue: i64 = conn
+            .query_row("SELECT COUNT(*) FROM refresh_queue", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(queue, 2);
+        // last_seen_in_list_at is set.
+        let seen: f64 = conn
+            .query_row(
+                "SELECT last_seen_in_list_at FROM conversations WHERE remote_conversation_id='conv-a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(seen > 0.0);
+    }
+
+    #[test]
+    fn list_ingest_ignores_body_like_fields_and_does_not_echo_them() {
+        let db = temp_db();
+        let body = serde_json::json!({
+            "items": [
+                {
+                    "id": "conv-x",
+                    "title": "X",
+                    "mapping": {"root": {"big": "object"}},
+                    "messages": [{"role": "user", "content": {"parts": ["secret text"]}}],
+                    "content": {"parts": ["more text"]},
+                    "parts": ["p1", "p2"],
+                    "text": "raw body text",
+                    "attachments": [{"foo": 1}],
+                    "nested": {"deep": {"object": [1, 2, 3]}}
+                }
+            ]
+        })
+        .to_string();
+        let req = list_request(&body, Some("Bearer secret"), Some(ALLOWED_ORIGIN));
+        let (_cors, resp) = handle_list_ingest(&req, &db, "secret").unwrap();
+        // Response is counts only; never echoes raw item JSON or body fields.
+        assert!(!resp.contains("mapping"));
+        assert!(!resp.contains("secret text"));
+        assert!(!resp.contains("raw body text"));
+        assert!(!resp.contains("attachments"));
+        assert!(resp.contains("\"ok\":true"));
+
+        let conn = open_test_conn(&db);
+        // No snapshots/docs created despite body-like fields present.
+        let snaps: i64 = conn
+            .query_row("SELECT COUNT(*) FROM conversation_snapshots", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(snaps, 0);
+        let docs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM search_documents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(docs, 0);
+        // Title was stored from the scalar field.
+        let title: String = conn
+            .query_row(
+                "SELECT title FROM conversations WHERE remote_conversation_id='conv-x'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(title, "X");
+    }
+
+    #[test]
+    fn list_ingest_enforces_token_origin_and_body_limit() {
+        let db = temp_db();
+        let body = serde_json::json!({"items":[{"id":"c"}]}).to_string();
+
+        // Missing token -> 401
+        let req = list_request(&body, None, Some(ALLOWED_ORIGIN));
+        assert_eq!(err_status(handle_list_ingest(&req, &db, "secret")), 401);
+        // Wrong token -> 401
+        let req = list_request(&body, Some("Bearer wrong"), Some(ALLOWED_ORIGIN));
+        assert_eq!(err_status(handle_list_ingest(&req, &db, "secret")), 401);
+        // Bad origin -> 403
+        let req = list_request(&body, Some("Bearer secret"), Some("https://evil.example"));
+        assert_eq!(err_status(handle_list_ingest(&req, &db, "secret")), 403);
+        // No origin (local test) -> ok
+        let req = list_request(&body, Some("Bearer secret"), None);
+        let (cors, _) = handle_list_ingest(&req, &db, "secret").unwrap();
+        assert!(!cors);
+
+        // Body too large -> 413
+        let big = serde_json::json!({
+            "items": [{"id": "x".repeat(300_000)}]
+        })
+        .to_string();
+        let req = list_request(&big, Some("Bearer secret"), Some(ALLOWED_ORIGIN));
+        assert_eq!(err_status(handle_list_ingest(&req, &db, "secret")), 413);
+    }
+
+    #[test]
+    fn new_endpoints_preflight_origin_and_methods() {
+        let mut buf = Vec::new();
+        cors_preflight_response(&mut buf, true, "POST, OPTIONS").unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("Access-Control-Allow-Methods: POST, OPTIONS"));
+
+        let mut buf = Vec::new();
+        cors_preflight_response(&mut buf, true, "GET, OPTIONS").unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("Access-Control-Allow-Methods: GET, OPTIONS"));
+        assert!(s.contains("Access-Control-Allow-Origin: https://chatgpt.com"));
+        assert!(s.contains("Vary: Origin"));
+
+        // Denied preflight has no CORS headers.
+        let mut buf = Vec::new();
+        cors_preflight_response(&mut buf, false, "POST, OPTIONS").unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.starts_with("HTTP/1.1 403"));
+        assert!(!s.contains("Access-Control-Allow-Origin"));
+    }
+
+    #[test]
+    fn events_and_lease_endpoints_require_token_and_origin() {
+        let db = temp_db();
+        let ev = serde_json::json!({"kind":"adapter_hello"}).to_string();
+
+        // events: no token -> 401
+        assert_eq!(
+            err_status(handle_events(
+                &event_request(&ev, None, Some(ALLOWED_ORIGIN)),
+                &db,
+                "secret"
+            )),
+            401
+        );
+        // events: bad origin -> 403
+        assert_eq!(
+            err_status(handle_events(
+                &event_request(&ev, Some("Bearer secret"), Some("https://evil.example")),
+                &db,
+                "secret"
+            )),
+            403
+        );
+        // lease: no token -> 401
+        assert_eq!(
+            err_status(handle_lease(
+                &lease_request(None, Some(ALLOWED_ORIGIN)),
+                &db,
+                "secret"
+            )),
+            401
+        );
+        // lease: bad origin -> 403
+        assert_eq!(
+            err_status(handle_lease(
+                &lease_request(Some("Bearer secret"), Some("https://evil.example")),
+                &db,
+                "secret"
+            )),
+            403
+        );
+        // report: no token -> 401
+        let rep = serde_json::json!({"lease_id":"x","ok":true}).to_string();
+        assert_eq!(
+            err_status(handle_report(
+                &report_request(&rep, None, Some(ALLOWED_ORIGIN)),
+                &db,
+                "secret"
+            )),
+            401
+        );
+    }
+
+    #[test]
+    fn navigation_event_creates_known_row_and_one_opened_queue_row() {
+        let db = temp_db();
+        let body = serde_json::json!({
+            "kind": "navigation",
+            "conversation_id": "nav-1",
+            "url": "https://chatgpt.com/c/nav-1",
+            "reason": "opened"
+        })
+        .to_string();
+        let req = event_request(&body, Some("Bearer secret"), Some(ALLOWED_ORIGIN));
+        let (cors, resp) = handle_events(&req, &db, "secret").unwrap();
+        assert!(cors);
+        assert!(resp.contains("\"ok\":true"));
+
+        let conn = open_test_conn(&db);
+        let convs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversations WHERE remote_conversation_id='nav-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(convs, 1);
+        let queue: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM refresh_queue WHERE reason='opened'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(queue, 1);
+        let priority: i64 = conn
+            .query_row(
+                "SELECT priority FROM refresh_queue WHERE reason='opened'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(priority, OPENED_PRIORITY);
+    }
+
+    #[test]
+    fn navigation_extracts_id_from_url_when_conversation_id_absent() {
+        let db = temp_db();
+        let body = serde_json::json!({
+            "kind": "navigation",
+            "url": "https://chatgpt.com/c/from-url-42"
+        })
+        .to_string();
+        let req = event_request(&body, Some("Bearer secret"), None);
+        handle_events(&req, &db, "secret").unwrap();
+        let conn = open_test_conn(&db);
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversations WHERE remote_conversation_id='from-url-42'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn dirty_event_coalesces_and_updates_not_before() {
+        let db = temp_db();
+        let conn = open_test_conn(&db);
+        // Seed a known row first via navigation.
+        let body = serde_json::json!({
+            "kind": "navigation",
+            "conversation_id": "dirty-1"
+        })
+        .to_string();
+        handle_events(
+            &event_request(&body, Some("Bearer secret"), None),
+            &db,
+            "secret",
+        )
+        .unwrap();
+
+        // First dirty event.
+        let body = serde_json::json!({"kind":"dirty","conversation_id":"dirty-1"}).to_string();
+        handle_events(
+            &event_request(&body, Some("Bearer secret"), None),
+            &db,
+            "secret",
+        )
+        .unwrap();
+        let nb1: f64 = conn
+            .query_row(
+                "SELECT not_before FROM refresh_queue WHERE reason='dirty'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // Second dirty event should coalesce (still one row) and push not_before later.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        handle_events(
+            &event_request(&body, Some("Bearer secret"), None),
+            &db,
+            "secret",
+        )
+        .unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM refresh_queue WHERE reason='dirty'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        let nb2: f64 = conn
+            .query_row(
+                "SELECT not_before FROM refresh_queue WHERE reason='dirty'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            nb2 >= nb1,
+            "not_before should not move earlier on dirty coalesce"
+        );
+    }
+
+    #[test]
+    fn lease_grant_creates_one_active_lease_then_no_work() {
+        let db = temp_db();
+        // Seed a due refresh row via navigation.
+        let body = serde_json::json!({
+            "kind": "navigation",
+            "conversation_id": "lease-1"
+        })
+        .to_string();
+        handle_events(
+            &event_request(&body, Some("Bearer secret"), None),
+            &db,
+            "secret",
+        )
+        .unwrap();
+
+        let req = lease_request(Some("Bearer secret"), Some(ALLOWED_ORIGIN));
+        let (cors, resp) = handle_lease(&req, &db, "secret").unwrap();
+        assert!(cors);
+        assert!(resp.contains("\"lease\":{"));
+        assert!(resp.contains("\"type\":\"detail\""));
+        assert!(resp.contains("/backend-api/conversation/lease-1"));
+        assert!(resp.contains("\"deadline_ms\":30000"));
+
+        // A second call while one active lease exists returns no work.
+        let req = lease_request(Some("Bearer secret"), Some(ALLOWED_ORIGIN));
+        let (_cors2, resp2) = handle_lease(&req, &db, "secret").unwrap();
+        assert!(resp2.contains("\"lease\":null"));
+        assert!(resp2.contains("\"poll_after_ms\":5000"));
+    }
+
+    #[test]
+    fn lease_returns_no_work_when_queue_empty() {
+        let db = temp_db();
+        let req = lease_request(Some("Bearer secret"), None);
+        let (_, resp) = handle_lease(&req, &db, "secret").unwrap();
+        assert!(resp.contains("\"lease\":null"));
+    }
+
+    #[test]
+    fn report_429_sets_cooldown_and_prevents_further_lease() {
+        let db = temp_db();
+        // Seed + grant a lease.
+        let body = serde_json::json!({"kind":"navigation","conversation_id":"r429"}).to_string();
+        handle_events(
+            &event_request(&body, Some("Bearer secret"), None),
+            &db,
+            "secret",
+        )
+        .unwrap();
+        let (_, lease_resp) =
+            handle_lease(&lease_request(Some("Bearer secret"), None), &db, "secret").unwrap();
+        // Extract lease_id from response.
+        let v: Value = serde_json::from_str(&lease_resp).unwrap();
+        let lease_id = v["lease"]["lease_id"].as_str().unwrap().to_string();
+
+        // Report 429.
+        let rep = serde_json::json!({
+            "lease_id": lease_id,
+            "ok": false,
+            "status": 429,
+            "retry_after_ms": 60000,
+            "error": "rate_limited"
+        })
+        .to_string();
+        let req = report_request(&rep, Some("Bearer secret"), None);
+        let (_, rresp) = handle_report(&req, &db, "secret").unwrap();
+        assert!(rresp.contains("\"ok\":true"));
+
+        // Further lease grant is blocked by global cooldown.
+        let (_, resp2) =
+            handle_lease(&lease_request(Some("Bearer secret"), None), &db, "secret").unwrap();
+        assert!(resp2.contains("\"lease\":null"));
+        assert!(resp2.contains("\"poll_after_ms\":"));
+        let conn = open_test_conn(&db);
+        let cd: f64 = get_service_state_f64(&conn, "global_cooldown_until").unwrap();
+        assert!(cd > now_secs());
+    }
+
+    #[test]
+    fn report_rejects_forbidden_body_headers_and_token_fields() {
+        let db = temp_db();
+        // Seed + grant.
+        let body = serde_json::json!({"kind":"navigation","conversation_id":"rforb"}).to_string();
+        handle_events(
+            &event_request(&body, Some("Bearer secret"), None),
+            &db,
+            "secret",
+        )
+        .unwrap();
+        let (_, lease_resp) =
+            handle_lease(&lease_request(Some("Bearer secret"), None), &db, "secret").unwrap();
+        let v: Value = serde_json::from_str(&lease_resp).unwrap();
+        let lease_id = v["lease"]["lease_id"].as_str().unwrap().to_string();
+
+        for field in [
+            "body",
+            "response",
+            "html",
+            "json",
+            "headers",
+            "authorization",
+            "cookie",
+            "accessToken",
+        ] {
+            let rep = serde_json::json!({
+                "lease_id": lease_id,
+                "ok": false,
+                field: "some-chatgpt-response-content"
+            })
+            .to_string();
+            let req = report_request(&rep, Some("Bearer secret"), None);
+            let code = err_status(handle_report(&req, &db, "secret"));
+            assert_eq!(code, 400, "field {field} should be rejected with 400");
+        }
+    }
+
+    #[test]
+    fn report_404_increments_failure_and_dirty_event_can_requeue() {
+        let db = temp_db();
+        // Seed + grant.
+        let body = serde_json::json!({"kind":"navigation","conversation_id":"r404"}).to_string();
+        handle_events(
+            &event_request(&body, Some("Bearer secret"), None),
+            &db,
+            "secret",
+        )
+        .unwrap();
+        let (_, lease_resp) =
+            handle_lease(&lease_request(Some("Bearer secret"), None), &db, "secret").unwrap();
+        let v: Value = serde_json::from_str(&lease_resp).unwrap();
+        let lease_id = v["lease"]["lease_id"].as_str().unwrap().to_string();
+
+        // Report 404 failure.
+        let rep = serde_json::json!({
+            "lease_id": lease_id,
+            "ok": false,
+            "status": 404,
+            "error": "not_found"
+        })
+        .to_string();
+        let req = report_request(&rep, Some("Bearer secret"), None);
+        handle_report(&req, &db, "secret").unwrap();
+
+        let conn = open_test_conn(&db);
+        let failures: i64 = conn
+            .query_row(
+                "SELECT consecutive_failures FROM conversations WHERE remote_conversation_id='r404'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(failures, 1);
+        // The queue row was pushed into the backoff window (not_before in future).
+        let nb: f64 = conn
+            .query_row(
+                "SELECT not_before FROM refresh_queue WHERE conversation_pk=(
+                    SELECT conversation_pk FROM conversations WHERE remote_conversation_id='r404'
+                ) AND reason='opened'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(nb > now_secs());
+
+        // Move the queue row's not_before into the past to simulate backoff
+        // elapsing, then a dirty event should be able to enqueue (different
+        // reason coalesces separately).
+        conn.execute("UPDATE refresh_queue SET not_before = 0", [])
+            .unwrap();
+        // A dirty event creates a 'dirty' queue row (distinct reason).
+        let dirty_body = serde_json::json!({"kind":"dirty","conversation_id":"r404"}).to_string();
+        handle_events(
+            &event_request(&dirty_body, Some("Bearer secret"), None),
+            &db,
+            "secret",
+        )
+        .unwrap();
+        let dirty_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM refresh_queue WHERE reason='dirty'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dirty_count, 1);
+        // Lease can be granted again because failures < 3.
+        let (_, resp) =
+            handle_lease(&lease_request(Some("Bearer secret"), None), &db, "secret").unwrap();
+        assert!(
+            resp.contains("\"lease\":{"),
+            "lease should be granted when failures < 3: {resp}"
+        );
+    }
+
+    #[test]
+    fn report_success_clears_queue_and_resets_failures() {
+        let db = temp_db();
+        // Seed + grant.
+        let body = serde_json::json!({"kind":"navigation","conversation_id":"rok"}).to_string();
+        handle_events(
+            &event_request(&body, Some("Bearer secret"), None),
+            &db,
+            "secret",
+        )
+        .unwrap();
+        let (_, lease_resp) =
+            handle_lease(&lease_request(Some("Bearer secret"), None), &db, "secret").unwrap();
+        let v: Value = serde_json::from_str(&lease_resp).unwrap();
+        let lease_id = v["lease"]["lease_id"].as_str().unwrap().to_string();
+
+        let rep = serde_json::json!({"lease_id": lease_id, "ok": true}).to_string();
+        let req = report_request(&rep, Some("Bearer secret"), None);
+        handle_report(&req, &db, "secret").unwrap();
+
+        let conn = open_test_conn(&db);
+        let queue: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM refresh_queue WHERE conversation_pk=(
+                    SELECT conversation_pk FROM conversations WHERE remote_conversation_id='rok'
+                )",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(queue, 0);
+        let lease_status: String = conn
+            .query_row(
+                "SELECT status FROM refresh_leases WHERE lease_id=?1",
+                params![lease_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(lease_status, "succeeded");
+    }
+
+    #[test]
+    fn adapter_hello_updates_last_seen() {
+        let db = temp_db();
+        let body = serde_json::json!({"kind":"adapter_hello"}).to_string();
+        handle_events(
+            &event_request(&body, Some("Bearer secret"), None),
+            &db,
+            "secret",
+        )
+        .unwrap();
+        let conn = open_test_conn(&db);
+        let ts: f64 = get_service_state_f64(&conn, "last_adapter_seen_at").unwrap();
+        assert!(ts > 0.0);
+    }
+
+    #[test]
+    fn parse_navigation_conversation_id_extracts_id_from_c_path() {
+        assert_eq!(
+            parse_navigation_conversation_id("https://chatgpt.com/c/abc-123"),
+            Some("abc-123".to_string())
+        );
+        assert_eq!(
+            parse_navigation_conversation_id("https://chatgpt.com/c/abc-123?foo=bar"),
+            Some("abc-123".to_string())
+        );
+        assert_eq!(
+            parse_navigation_conversation_id("https://chatgpt.com/"),
+            None
+        );
+        assert_eq!(
+            parse_navigation_conversation_id("https://example.com/c/x"),
+            None
+        );
     }
 }
